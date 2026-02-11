@@ -1,0 +1,13 @@
+RFC-CRAWL-ORCHESTRATION-004 (SUPERSEDED)
+
+이 RFC는 `rfc/005`로 통합되었으며, 중복 본문은 제거되었다.
+
+## Canon
+
+- Canon (merged final): `./005`
+- Spec (normative): `../docs/spec/authority-and-events.md`, `../docs/spec/raw-and-replay-index.md`, `../docs/spec/admission-and-egress.md`
+
+## Historical original
+
+- 원문 보관: `./archive/004`
+

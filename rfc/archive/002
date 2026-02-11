@@ -1,0 +1,367 @@
+RFC-CRAWL-ORCHESTRATION-002-FINAL
+Title: Versioned Workflow SSOT 기반 크롤링/수집 플랫폼 — SOTA 장기 운영 아키텍처
+Status: FINAL
+Goal: 5–10년 이상 운영 가능한 구조적 완결성 확보
+Primary Target: AWS
+Portability Goal: 멀티클라우드/온프렘/실기기 실행 이식 가능
+1. Executive Summary
+1-1. 핵심 결론
+
+본 RFC는 크롤링·수집 플랫폼을 다음 3개 SSOT 분리 모델 위에 고정함
+정의 SSOT (WorkflowDefinition)
+실행 SSOT (Run/Task/Attempt/Artifact)
+Raw SSOT (불변 데이터 진실 소스)
+1-2. 아키텍처 철학
+
+Control Plane = 영속 SSOT
+Data Plane = 교체 가능한 실행층
+Raw = 불변 진실 소스
+모든 실행은 버전 단위 재현 가능
+1-3. 보장되는 성질
+
+대규모 fan-out 안정 처리
+Rerun/Replay/Requeue 1급 지원
+외부/실기기 워커 통합 가능
+오케스트레이터/클라우드 교체 가능
+장기 운영 시 재현성 보장
+2. Non-Negotiable Design Laws
+2-1. Law-SSOT-1 정의/실행/Raw 분리
+
+WorkflowDefinition, RunState, RawData는 물리적으로 분리된 저장소 사용
+2-2. Law-IMMUTABLE-1 정의 불변
+
+publish된 workflow_version은 수정 불가, 참조만 허용
+2-3. Law-RAW-1 Raw 불변
+
+Raw는 삭제/수정 금지, 재처리의 유일한 진실 소스
+2-4. Law-ENGINE-SWAP-1 엔진 독립성
+
+Workflow DSL은 특정 오케스트레이터에 종속되지 않음
+2-5. Law-SEM-1 표준 상태 머신
+
+Task/Attempt 전이는 표준 상태 머신 스펙을 따름
+2-6. Law-CANON-1 Canonicalization 고정
+
+input_digest는 명시된 canonicalization 스펙 + 버전 기반
+2-7. Law-IDEMP-RESULT-1 결과 멱등
+
+멱등은 “중복 방지”가 아니라 “동일 입력 → 동일 결과 재사용”까지 포함
+2-8. Law-BACKPRESSURE-1 Fan-out 제어
+
+모든 fan-out step은 동시성/예산/backpressure 규칙 필수
+2-9. Law-PROVENANCE-1 Lineage 필수
+
+Raw/Derived는 provenance manifest 동반 필수
+2-10. Law-TRUST-1 외부 워커 커밋
+
+외부 워커 산출물은 Control Plane 검증 후 최종 커밋
+3. SSOT 모델
+3-1. Workflow 정의 SSOT
+Entity: WorkflowDefinition(versioned)
+구성
+
+DAG 그래프
+step I/O schema
+retry/timeout 정책
+step_catalog_version
+canonical_spec_version
+checksum
+정적 검증
+
+순환 참조 금지
+schema mismatch 금지
+fan-out 상한
+글로벌 timeout 예산
+비용 폭발 패턴 차단
+3-2. 실행 SSOT
+Entities
+
+Run
+Task
+TaskAttempt
+Artifact
+키 표준
+
+task_key = run_id + step_id + shard_key
+input_digest = canonical(input) hash
+idempotency_key = step_id + input_digest + workflow_version
+Idempotency 저장 모델
+
+DynamoDB에 idempotency_key → artifact_ref 매핑 저장
+재실행 시 기존 결과 재사용
+3-3. Raw 데이터 SSOT
+Storage: S3 Raw Zone
+Raw Object
+
+raw body
+status code
+final URL
+headers snapshot
+fetch timing
+robots 판단
+rendering 여부
+Raw Manifest (필수)
+
+fetcher_type/version
+policy_digest
+network_profile
+attempt_id
+wall_time
+Derived
+
+derived/{parser_version}/...
+parent_raw_ref 필수
+transform_chain_digest 포함
+4. AWS 기준 참조 아키텍처
+4-1. Core
+
+Scheduling: EventBridge
+Orchestration: Step Functions
+Execution: ECS Fargate / Lambda
+Queue: SQS
+Runtime State: DynamoDB
+Control Plane: RDS
+Storage: S3
+4-2. Optional
+
+OpenSearch
+SNS
+X-Ray
+EventBridge Bus
+4-3. 오케스트레이션 전략
+
+Step Functions는 제어/집계 중심
+대량 fan-out은 SQS + Worker Pool로 외부화
+per-URL 실행은 워커가 담당
+5. 아키텍처 레이어
+5-1. Control Plane
+역할
+
+WorkflowDefinition SSOT
+버전 관리
+lint/정적검증
+publish pipeline
+스케줄 매핑
+원칙
+
+클라우드 종속 최소화
+RDS + 표준 API 기반
+5-2. Orchestration Layer
+책임
+
+DAG 실행
+상태 전이 관리
+분배/집계 제어
+대체 가능
+
+Temporal
+Argo
+Custom Engine
+5-3. Execution Layer
+Pluggable
+
+ECS Worker
+Lambda
+External Worker
+Physical Device Worker
+6. External / Physical Worker 모델
+6-1. Pull 기반
+
+SQS Job Queue
+Worker poll
+결과 S3 업로드
+API로 완료 보고
+6-2. Worker Registry
+
+worker_id
+capability
+network_profile
+last_seen
+6-3. Artifact Commit Flow
+
+Worker presigned URL로 업로드
+artifact_digest 제출
+Control Plane 검증
+Artifact 레코드 확정
+Task 상태 전이
+7. 실행 의미론 (Run Semantics)
+7-1. Task 상태 머신
+
+Queued
+Running
+Succeeded
+Failed
+TimedOut
+Cancelled
+Abandoned
+7-2. 재시도
+
+동일 Task 내 Attempt 증가
+7-3. Requeue
+
+동일 input_digest 유지
+새 Attempt 생성
+7-4. Replay
+
+네트워크 fetch 금지
+기존 Raw 재사용
+7-5. Rerun
+
+새로운 run_id
+전체 재실행
+8. Workflow DSL
+8-1. 형식
+
+JSON 기반 고정 DSL
+OpenAPI/Zod schema
+8-2. Step 카탈로그
+Fetch
+
+HttpFetch
+BrowserFetch
+DeviceFetch
+Transform
+
+Extract
+Normalize
+Enrich
+Control
+
+Map
+If
+RateLimitGate
+DedupGate
+Sink
+
+PutS3
+UpsertRDS
+IndexSearch
+EmitEvent
+8-3. Backpressure 필드
+
+max_concurrency
+budget_limit
+token_bucket_policy
+9. 데이터 모델
+9-1. RDS
+
+workflows
+workflow_versions
+schedules
+sources
+step_catalog
+9-2. DynamoDB
+
+runs
+tasks
+task_attempts
+idempotency_records
+locks
+9-3. S3
+
+raw
+derived
+logs
+debug
+10. Source 정책 시스템
+10-1. Preset
+
+도메인군 정책 템플릿
+10-2. Override
+
+최소 필드만 덮어쓰기
+10-3. Policy Digest
+
+정책 변경은 digest 변경으로만 반영
+
+과거 실행 재현 가능
+11. Admin Studio
+기능
+
+DAG 시각 설계
+Step 템플릿
+Preview Run
+Version Diff
+Rollback
+Drift Detection
+원칙
+
+정의 변경은 항상 새 버전 생성
+12. 관측 표준
+모든 Task는
+
+run_id
+step_id
+url_digest
+source_id
+
+기준으로 추적 가능
+단일 URL E2E 뷰 제공
+13. 확장성 전략
+13-1. 엔진 교체
+
+DSL 유지, 엔진만 교체
+13-2. 멀티클라우드
+
+Execution Layer 교체
+13-3. 파트너 워커
+
+SQS + 계약 기반 통합
+13-4. 데이터 확장
+
+Raw/Derived 분리로 스토리지 수평 확장 용이
+14. Implementation Roadmap
+Phase 1
+
+Workflow CRUD
+Step Functions 생성
+HttpFetch
+Raw 저장
+Phase 2
+
+BrowserFetch
+SQS fan-out
+Dedup/Validate
+Phase 3
+
+Device Workers
+Partial Rerun UI
+Replay Pipeline
+Policy Preset
+Phase 4
+
+Multi-engine 지원
+Cross-cloud Execution
+15. SOTA 포지셔닝 코멘트
+15-1. 왜 SOTA인지
+
+SSOT 3분리 구조
+재현성 중심 설계
+멱등 결과 재사용 모델
+Provenance/Lineage 내장
+엔진 독립 DSL
+실기기 워커 1급 지원
+15-2. 시비 방어 포인트
+
+모든 변경은 버전 단위
+실행 의미론이 스펙으로 고정
+Raw 불변으로 재처리 보장
+외부 워커는 신뢰 경계 밖으로 모델링
+15-3. 장기 확장성 코멘트
+
+Control Plane 안정 시 10년 이상 유지 가능
+Data Plane은 기술 변화에 맞춰 교체 가능
+DSL과 Canonicalization 스펙이 장기 호환성의 핵심
+16. 최종 결론
+본 설계는
+
+대규모 fan-out
+수백~수천 소스
+장기 운영
+반복 재처리
+실기기 요구
+
+환경에서 구조적 결함 없이 운영 가능한 아키텍처임.
+
+어케생각함
+

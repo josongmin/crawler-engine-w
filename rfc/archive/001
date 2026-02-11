@@ -1,0 +1,591 @@
+1. Executive Summary
+
+1-1. 목표
+본 스펙은 Run/Task/Attempt/Artifact의 상태 전이를 “해석 여지 0”으로 고정하여, 재시도/재큐/리플레이/취소/중단/중복 실행/외부 워커 지연 등 운영 지옥 케이스에서도 시비가 불가능한 실행 의미론을 제공함.
+
+1-2. 핵심 원칙
+
+단일 권위: Execution Authority = DynamoDB
+
+전이 단위: TaskAttempt가 실행의 최소 단위
+
+멱등: idempotency_key 단위로 결과 재사용
+
+커밋: 외부 산출물은 Control Plane 검증 후 커밋
+
+Replay: Capability Step 금지, RawRef 결정 규칙 고정
+
+상태 전이는 모두 “가드(guard) + 원자 조건(conditional write)”로만 발생
+
+2. 용어 및 범위
+
+2-1. Entities
+
+Run: workflow_version 단위 실행 컨테이너
+
+Task: step_id + shard_key 단위 작업 정의
+
+TaskAttempt: Task의 실제 실행 인스턴스(재시도/재큐는 Attempt 생성)
+
+Artifact: 성공 결과(및 Raw/Derived 포함) 참조 객체
+
+IdempotencyRecord: idempotency_key → artifact_ref 매핑(결과 재사용 SSOT)
+
+2-2. 상태 표기
+
+상태는 “명시적 열거형”이며, 임의 문자열/확장 금지(Closed Set)
+
+Terminal 상태는 별도 정의(복구 불가/완료)
+
+3. 상태 열거형 정의
+3-1. RunState (Closed Set)
+
+RUN_CREATED
+
+RUN_QUEUED
+
+RUN_RUNNING
+
+RUN_PAUSING
+
+RUN_PAUSED
+
+RUN_CANCELLING
+
+RUN_CANCELLED (Terminal)
+
+RUN_SUCCEEDED (Terminal)
+
+RUN_FAILED (Terminal)
+
+RUN_ABORTED (Terminal)
+
+정의
+
+RUN_FAILED: 정책상 실패(필수 태스크 실패, 예산 초과 등)
+
+RUN_ABORTED: 시스템 결함/권위 상실로 일관성 보장 불가(운영상 “중단”)
+
+3-2. TaskState (Closed Set)
+
+TASK_CREATED
+
+TASK_BLOCKED
+
+TASK_READY
+
+TASK_DEDUPED (Terminal)
+
+TASK_RUNNING
+
+TASK_SUCCEEDED (Terminal)
+
+TASK_FAILED (Terminal)
+
+TASK_CANCELLED (Terminal)
+
+TASK_ABANDONED (Terminal)
+
+정의
+
+TASK_BLOCKED: upstream 미완료, 또는 admission token 대기
+
+TASK_DEDUPED: idempotency hit로 실행 없이 결과 재사용 확정
+
+TASK_ABANDONED: 실행 주체 상실/시간초과/lease 만료로 더 이상 자동 복구하지 않음(명시적 수동 조치 필요)
+
+3-3. AttemptState (Closed Set)
+
+ATTEMPT_CREATED
+
+ATTEMPT_LEASED
+
+ATTEMPT_DISPATCHED
+
+ATTEMPT_RUNNING
+
+ATTEMPT_UPLOADING
+
+ATTEMPT_VERIFYING
+
+ATTEMPT_SUCCEEDED (Terminal)
+
+ATTEMPT_FAILED (Terminal)
+
+ATTEMPT_TIMED_OUT (Terminal)
+
+ATTEMPT_CANCELLED (Terminal)
+
+ATTEMPT_LOST (Terminal)
+
+정의
+
+ATTEMPT_LEASED: 워커가 소유권(lease)을 획득
+
+ATTEMPT_DISPATCHED: (외부 워커) job이 큐로 전달되어 실행 대기
+
+ATTEMPT_LOST: 워커 죽음/네트워크 분리로 상태 확정 불가(lease 만료로 판정)
+
+3-4. ArtifactState (Closed Set)
+
+ARTIFACT_STAGED
+
+ARTIFACT_COMMITTED (Terminal)
+
+ARTIFACT_REJECTED (Terminal)
+
+정의
+
+STAGED: 업로드 완료, 검증/커밋 전
+
+COMMITTED: digest 검증 및 메타 검증 통과, SSOT에 확정
+
+REJECTED: 검증 실패(무결성/스키마/정책 위반)
+
+4. 공통 가드 규칙(Non-Negotiable Guards)
+
+4-1. Guard-GEN-1 (Monotonicity)
+모든 상태 전이는 단방향이며, 이전 상태로 되돌아갈 수 없음.
+
+4-2. Guard-GEN-2 (Single Active Attempt)
+하나의 Task는 동시에 1개의 활성 Attempt만 가질 수 있음.
+활성 Attempt = non-terminal AttemptState.
+
+4-3. Guard-GEN-3 (Authority Conditional Write)
+모든 전이는 DynamoDB conditional write로만 수행됨.
+조건 불일치 시 전이는 실패하며, 재시도는 호출자가 수행.
+
+4-4. Guard-GEN-4 (Idempotency First)
+TASK_READY 진입 시점에 idempotency_key 조회를 먼저 수행해야 함.
+Hit 시 TASK_DEDUPED로 종료.
+
+4-5. Guard-GEN-5 (Admission Required)
+Capability Step은 admission_token 없이는 ATTEMPT_RUNNING 진입 불가.
+
+4-6. Guard-GEN-6 (Commit Gate)
+외부 워커 산출물은 ARTIFACT_COMMITTED 전에는 성공으로 간주 불가.
+즉, Attempt는 VERIFYING을 통과해야 SUCCEEDED 가능.
+
+5. TaskAttempt 전이 스펙(정식)
+5-1. Attempt 생성
+
+T-ATT-1
+ATTEMPT_CREATED는 다음 조건에서만 생성됨
+
+TaskState ∈ {TASK_READY, TASK_RUNNING}
+
+Single Active Attempt 가드 만족
+
+retry/requeue 정책이 Attempt 생성 허용
+
+효과
+
+attempt_no = prev_attempt_no + 1
+
+lease_expires_at 설정(초기 null 또는 즉시 leasing)
+
+5-2. Leasing (내부 워커/ECS)
+
+T-ATT-2
+ATTEMPT_CREATED → ATTEMPT_LEASED
+
+Guard
+
+attempt.state == ATTEMPT_CREATED
+
+now < run.deadline
+
+worker_id 제공
+
+conditional write: lease_owner is null AND state == CREATED
+
+Effects
+
+lease_owner = worker_id
+
+lease_expires_at = now + lease_ttl
+
+heartbeat_deadline = now + heartbeat_interval
+
+5-3. Dispatching (외부 워커/SQS)
+
+T-ATT-3
+ATTEMPT_CREATED → ATTEMPT_DISPATCHED
+
+Guard
+
+external_required == true
+
+state == CREATED
+
+job_enqueued == false
+
+Effects
+
+enqueue SQS job (job_id)
+
+attempt.job_id = job_id
+
+state = DISPATCHED
+
+Note
+
+enqueue와 상태 갱신은 outbox 패턴으로 원자성 확보(권장)
+
+5-4. Running
+
+T-ATT-4
+ATTEMPT_LEASED or ATTEMPT_DISPATCHED → ATTEMPT_RUNNING
+
+Guard
+
+admission_required == false OR admission_token present
+
+state in {LEASED, DISPATCHED}
+
+lease_owner matches worker_id (LEASED 경로)
+
+Effects
+
+started_at 기록
+
+state = RUNNING
+
+5-5. Uploading (외부 산출물)
+
+T-ATT-5
+ATTEMPT_RUNNING → ATTEMPT_UPLOADING
+
+Guard
+
+produces_artifact == true
+
+state == RUNNING
+
+output_ref not set
+
+Effects
+
+presigned upload session 생성
+
+output_stage_ref 생성
+
+state = UPLOADING
+
+5-6. Verifying (커밋 검증)
+
+T-ATT-6
+ATTEMPT_UPLOADING → ATTEMPT_VERIFYING
+
+Guard
+
+stage_upload_complete == true
+
+artifact_digest provided
+
+state == UPLOADING
+
+Effects
+
+ArtifactState = ARTIFACT_STAGED 생성/갱신
+
+state = VERIFYING
+
+5-7. Success Commit
+
+T-ATT-7
+ATTEMPT_VERIFYING → ATTEMPT_SUCCEEDED
+
+Guard
+
+artifact.state == ARTIFACT_COMMITTED
+
+digest verified == true
+
+schema verified == true
+
+policy verified == true
+
+Effects
+
+attempt.output_artifact_ref 확정
+
+idempotency_record upsert (if absent)
+
+state = SUCCEEDED
+
+TaskState 후보: TASK_SUCCEEDED
+
+5-8. Failure
+
+T-ATT-8
+ATTEMPT_RUNNING/UPLOADING/VERIFYING → ATTEMPT_FAILED
+
+Guard
+
+error_class set
+
+retryable flag set (true/false)
+
+Effects
+
+error 기록(코드, 메시지, stack, category)
+
+state = FAILED
+
+TaskState 후보: TASK_FAILED or TASK_READY(재시도)
+
+5-9. Timeout
+
+T-ATT-9
+ATTEMPT_* (non-terminal) → ATTEMPT_TIMED_OUT
+
+Guard
+
+now > attempt.deadline OR now > lease_expires_at without heartbeat
+
+Effects
+
+state = TIMED_OUT
+
+TaskState 후보: TASK_READY(재시도 가능) or TASK_ABANDONED
+
+5-10. Lost (Lease expiry)
+
+T-ATT-10
+ATTEMPT_LEASED/DISPATCHED/RUNNING → ATTEMPT_LOST
+
+Guard
+
+now > lease_expires_at
+
+no heartbeat update
+
+Effects
+
+state = LOST
+
+TaskState 후보: TASK_READY(재시도) or TASK_ABANDONED
+
+5-11. Cancel
+
+T-ATT-11
+ATTEMPT_* (non-terminal) → ATTEMPT_CANCELLED
+
+Guard
+
+run.state in {RUN_CANCELLING, RUN_CANCELLED} OR task.cancel_requested == true
+
+Effects
+
+state = CANCELLED
+
+6. Task 전이 스펙(정식)
+6-1. Task 생성/블로킹
+
+T-TASK-1
+TASK_CREATED → TASK_BLOCKED
+Guard
+
+upstream 미완료 OR admission 대기 OR schedule gate 미통과
+
+6-2. Ready 진입 및 멱등 체크
+
+T-TASK-2
+TASK_BLOCKED → TASK_READY
+Guard
+
+upstream 완료
+
+inputs resolved
+
+admission 조건 충족 가능(토큰은 Attempt에서)
+
+Effects
+
+idempotency_key 계산
+
+idempotency 조회 수행
+
+T-TASK-3
+TASK_READY → TASK_DEDUPED
+Guard
+
+idempotency hit
+
+Effects
+
+task.output_artifact_ref = record.artifact_ref
+
+task.state = DEDUPED
+
+T-TASK-4
+TASK_READY → TASK_RUNNING
+Guard
+
+idempotency miss
+
+attempt created and leased/dispatched 성공
+
+Effects
+
+active_attempt_no 지정
+
+6-3. Task 완료
+
+T-TASK-5
+TASK_RUNNING → TASK_SUCCEEDED
+Guard
+
+active attempt SUCCEEDED
+
+output_artifact_ref set
+
+T-TASK-6
+TASK_RUNNING → TASK_FAILED
+Guard
+
+active attempt FAILED and retry budget exhausted OR non-retryable
+
+T-TASK-7
+TASK_* → TASK_CANCELLED
+Guard
+
+run cancelling/cancelled
+
+T-TASK-8
+TASK_RUNNING → TASK_ABANDONED
+Guard
+
+attempts lost 반복 초과 OR 운영 정책상 격리 필요
+
+7. Run 전이 스펙(정식)
+
+7-1. 시작
+RUN_CREATED → RUN_QUEUED → RUN_RUNNING
+
+가드
+
+workflow_version published
+
+schedule lock 획득
+
+7-2. 성공
+RUN_RUNNING → RUN_SUCCEEDED
+Guard
+
+모든 required task가 {SUCCEEDED, DEDUPED}
+
+실패 task 없음
+
+7-3. 실패
+RUN_RUNNING → RUN_FAILED
+Guard
+
+required task FAILED OR budget exceeded OR policy stop
+
+7-4. 취소
+RUN_RUNNING → RUN_CANCELLING → RUN_CANCELLED
+Guard
+
+cancel 요청
+
+7-5. 중단
+RUN_* → RUN_ABORTED
+Guard
+
+execution authority 손상 또는 일관성 보장 불가(운영 진단 이벤트)
+
+8. Rerun / Replay / Requeue 의미론과 상태머신 결합
+
+8-1. Rerun
+
+new run_id
+
+RUN_CREATED부터 새로 시작
+
+idempotency hit 가능
+
+8-2. Replay
+
+동일 run 또는 새 run에서 replay 모드
+
+Capability Step은 Attempt 생성 자체 금지
+
+RawRef는 Raw Selection Rule로 결정
+
+Attempt는 RUNNING 단계에서 외부 호출 없이 Transform만 수행
+
+8-3. RequeueTask
+
+동일 Task의 새 Attempt 생성
+
+input_digest 고정
+
+AttemptState는 CREATED부터
+
+9. 예외/경쟁 조건 처리(시비 방어 핵심)
+
+9-1. Double Worker Claim 방지
+
+lease_owner 조건부 갱신으로 단일 소유 보장
+
+충돌 시 loser는 즉시 중단
+
+9-2. “성공 보고”와 “커밋 실패”
+
+Attempt는 VERIFYING에서 멈춤
+
+Artifact가 COMMITTED 되기 전 SUCCEEDED 금지
+
+커밋 실패 시 Attempt FAILED 처리
+
+9-3. Out-of-order 이벤트
+
+전이는 항상 현재 상태 조건 검사
+
+늦게 온 이벤트는 무시(조건 불일치)
+
+9-4. Exactly-once 보장 주장 금지
+
+시스템은 At-least-once 실행
+
+결과는 Idempotency로 Exactly-once 효과 달성(정의된 의미론)
+
+10. 상태머신 불변식(Invariants)
+
+10-1. INV-1
+TASK_SUCCEEDED 또는 TASK_DEDUPED인 Task는 output_artifact_ref가 항상 존재
+
+10-2. INV-2
+ATTEMPT_SUCCEEDED인 Attempt는 output_artifact_ref가 존재하고, 해당 Artifact는 COMMITTED
+
+10-3. INV-3
+하나의 Task는 동시에 1개 이상의 non-terminal Attempt를 가질 수 없음
+
+10-4. INV-4
+Replay 모드에서는 Capability Step Attempt 생성이 불가
+
+10-5. INV-5
+IdempotencyRecord는 최초 커밋된 Artifact만 가리키며, 이후 변경 불가(append-only versioning만 허용)
+
+11. 최소 구현 체크리스트(정확히 이대로 구현)
+
+11-1. 모든 전이는 conditional write
+11-2. lease/heartbeat 테이블 필드 고정
+11-3. Attempt VERIFYING 단계 강제
+11-4. idempotency hit 경로는 TASK_DEDUPED로 terminal 처리
+11-5. Replay에서 capability step 차단
+11-6. Lost/Timeout 분기와 재시도/격리 정책 고정
+
+12. Appendix: 상태 전이 요약(실무용)
+
+12-1. Attempt 핵심 경로
+CREATED → LEASED/DISPATCHED → RUNNING → UPLOADING → VERIFYING → SUCCEEDED
+
+12-2. 실패 경로
+RUNNING/UPLOADING/VERIFYING → FAILED/TIMED_OUT/LOST → (정책) CREATED(재시도) 또는 TASK_FAILED/ABANDONED
+
+12-3. 멱등 경로
+TASK_READY → (idempotency hit) → TASK_DEDUPED
+

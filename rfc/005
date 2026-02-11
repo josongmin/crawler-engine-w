@@ -1,0 +1,256 @@
+RFC-CRAWL-ORCHESTRATION-005-CANON
+Title: Wine Crawler Engine Canon (Merged Final) — SSOT/IR/Determinism/Authority/Admission
+Status: CANON (Supersedes RFC-001~004)
+Goal: 구현/운영에서 “해석 여지 0”의 단일 엔트리포인트 제공
+
+1. Executive Summary
+
+본 문서는 RFC-001~004의 중복을 제거하고, 핵심 규범을 하나의 Canon으로 통합한다.
+세부 규범(SSOT 스펙)은 `docs/spec/`가 최종 권위이며, 본 RFC는 “원칙/경계/정의”를 고정한다.
+
+핵심 결론:
+
+- SSOT는 (Definition, Execution, Raw/Data, Lineage, Egress)로 분리되며, 각 도메인은 단 하나의 Authority를 가진다.
+- Workflow의 SSOT는 DAG가 아니라 Workflow IR이며, DAG는 IR의 View(Projection)이다.
+- 결정론 계약(Determinism Contract)과 실행 fingerprint 규칙을 통해 재현성과 결과 재사용(멱등)을 안전하게 보장한다.
+- 대규모 fan-out은 오케스트레이터가 아니라 큐+워커풀로 분리해 backpressure를 강제한다.
+- 외부/실기기 워커는 신뢰 경계 밖이며, 산출물은 커밋 게이트(VERIFYING/COMMITTED)로만 확정된다.
+
+2. Non-Negotiable Laws (Canonical)
+
+2-1. Law-SSOT-1 (Authority Split)
+
+각 도메인은 단 하나의 권위 저장소(Authority store)를 가진다. 교차 트랜잭션 금지.
+교차 저장소 상태는 Projection일 뿐 SSOT가 아니다.
+
+Authority 요약:
+
+- Definition Authority = RDS
+- Execution Authority = DynamoDB
+- Raw Authority = RawIndex(메타/선택 규칙) + S3(immutable blob)
+- Lineage Authority = Lineage Store (선정 ADR로 고정)
+- Egress Authority = DynamoDB (Egress SSOT)
+
+2-2. Law-IMMUTABLE-1 (Definition Immutability)
+
+Publish된 workflow_version은 불변이며 수정 불가. 변경은 항상 “새 버전 생성”으로만 반영.
+
+2-3. Law-RAW-1 (Raw Immutability)
+
+Raw는 삭제/수정 금지 원칙. 단, 규정 준수(PII/GDPR 등)를 위한 “effective delete”는 별도 스펙으로 정의한다.
+
+2-4. Law-SSOT-IR-1 (IR is SSOT)
+
+Workflow의 진실은 DAG가 아니라 Workflow IR이다.
+DAG는 IR의 시각적 Projection(UI View)이며, 프론트는 IR을 편집한다.
+
+2-5. Law-DET-1/2 (Determinism Contract)
+
+Step Output는 아래 인자들의 함수로 정의되어야 한다.
+
+- step_version
+- canonical_input (canonical_spec_version 포함)
+- task_context (time_seed/random_seed/locale/… 모든 비결정 요소는 명시적 입력)
+- capability_profile (network/egress/proxy/device 등)
+
+Replay는 외부 호출(Capability Step)을 금지하며 Raw + Transform만 수행한다.
+
+2-6. Law-IDEMP-RESULT-1 (Result Reuse Idempotency)
+
+멱등은 “중복 방지”가 아니라 “동일 실행 fingerprint → 동일 결과 재사용”을 의미한다.
+
+2-7. Law-LINEAGE-SSOT-1 (Lineage Required)
+
+Derived 데이터는 Lineage에 연결되지 않으면 유효하지 않다.
+
+2-8. Law-BACKPRESSURE-1 / Law-ADMISSION-1 (Physical Constraints)
+
+모든 fan-out step은 동시성/예산/backpressure 규칙이 필수다.
+Capability Step은 admission_token 없이 실행 불가이며, admission은 물리 자원(프록시/IP/도메인)을 모델로 포함한다.
+
+3. Canonical Vocabulary (Terms)
+
+- step_id: 워크플로우 내 노드 식별자(표현/연결용)
+- step_version: 실행 가능한 스텝 스펙(코드/컨테이너/스키마/정책)의 버전화된 식별자(결정론/라인리지/캐시의 기준)
+- canonical_spec_version: canonicalization 규칙 버전
+- input_digest: hash(canonical_spec_version + canonical(input))
+- capability_profile: 외부 세계 접촉에 필요한 실행 프로필(egress/network/proxy/device 등)
+- task_context: time_seed/random_seed/locale 등 비결정 요소의 명시적 입력
+- execution_fingerprint: 실행 결과를 식별하는 단일 지문(아래 참조)
+
+4. Execution Fingerprint (Canonical Key)
+
+RFC-001~004에서 idempotency_key 표기가 혼재되어 있었으므로, 단일 규칙으로 통일한다.
+
+- execution_fingerprint = hash(
+    step_version +
+    input_digest +
+    canonical_spec_version +
+    determinism_context_digest +
+    capability_profile_digest
+  )
+
+- idempotency_key = execution_fingerprint
+
+cache scope(예: workflow_version 포함 여부)는 ADR로 결정한다.
+
+5. Execution Semantics (Run/Task/Attempt/Artifact)
+
+실행 의미론(상태머신/가드/불변식)은 “해석 여지 0”으로 고정한다.
+본 Canon은 아래 불변식을 강제한다.
+
+- 모든 상태 전이는 conditional write 기반
+- Task는 동시에 1개의 active attempt만 허용
+- 외부 산출물은 COMMITTED 전 성공 불가(VERIFYING 단계 강제)
+- Replay 모드에서 Capability Step Attempt 생성 금지
+
+상세 전이 스펙은 `docs/spec/execution-semantics.md` 및 (히스토리) `rfc/archive/001`을 참조한다.
+
+6. Raw & Replay
+
+Replay는 항상 raw_ref를 “결정적으로” 선택해야 한다.
+RawIndex는 Replay/Lookup을 위한 권위 메타 SSOT이며, 규칙은 다음과 같다.
+
+1) policy_digest + fetcher_profile_digest 일치 우선
+2) 없으면 latest successful
+3) 그래도 없으면 Replay 실패
+
+상세는 `docs/spec/raw-and-replay-index.md`.
+
+7. Domain Events & Projections
+
+교차 저장소는 이벤트 + 프로젝션으로만 연결한다.
+이벤트 envelope 및 projector idempotency 규칙은 `docs/spec/authority-and-events.md`를 Canon으로 한다.
+
+8. Admission Control & Egress SSOT
+
+Capability Step 앞에는 Admission Control이 필수이며,
+proxy/IP/ban/capacity를 Egress SSOT로 관리한다.
+
+상세는 `docs/spec/admission-and-egress.md`.
+
+9. Lineage Graph SSOT
+
+Lineage는 computation graph이며:
+
+- Node = Artifact
+- Edge = Transform(step_version, execution_fingerprint)
+
+상세는 `docs/spec/lineage-graph.md`.
+
+10. AWS Reference (Non-binding)
+
+AWS는 참조 아키텍처일 뿐이며, Canon은 엔진/클라우드 교체 가능성을 전제로 한다.
+
+- Scheduling: EventBridge
+- Orchestration(Control/Aggregation): Step Functions
+- Fan-out: SQS + Worker Pool
+- Execution: ECS Fargate / Lambda / External / Device
+- Runtime State(Execution Authority): DynamoDB
+- Definition Authority: RDS
+- Storage: S3
+
+11. Where to Implement (Docs Canon)
+
+이 Canon을 구현으로 옮길 때, 아래 문서들이 “최종 권위”다.
+
+- `docs/spec/determinism-and-fingerprint.md`
+- `docs/spec/execution-semantics.md`
+- `docs/spec/authority-and-events.md`
+- `docs/spec/raw-and-replay-index.md`
+- `docs/spec/admission-and-egress.md`
+- `docs/spec/lineage-graph.md`
+- `docs/spec/workflow-validation-and-lint.md`
+
+12. Superseded RFCs
+
+RFC-001~004는 본 문서로 통합되었으며, 원문은 `rfc/archive/`로 이동되어 유지된다.
+
+13. SOTA Architecture Principles (Normative)
+
+본 Canon이 업계·학계 SOTA와 정합하기 위해 아래 8개 원칙을 명시적으로 고정한다.
+
+13-1. Dual Authority Separation (P1)
+
+Definition Authority(RDS)와 Execution Authority(DynamoDB)는 물리적/논리적으로 완전 분리.
+교차 트랜잭션 금지. 교차 데이터는 Projection이며 SSOT 아님.
+이것은 Law-SSOT-1의 구현 수준 강화이다.
+
+13-2. Immutable Versioning (P2)
+
+workflow_version, artifact, raw blob은 불변.
+수정은 항상 새 버전/새 run_id로만 표현.
+이것은 Law-IMMUTABLE-1 + Law-RAW-1의 통합 원칙이다.
+
+13-3. Deterministic Fingerprinting (P3)
+
+execution_fingerprint = hash(step_version + input_digest + canonical_spec_version + determinism_context_digest + capability_profile_digest).
+이것이 캐시/중복제거/재현성의 **유일** 기준.
+fingerprint에 포함하지 않는 항목(workflow_version, run_id, worker_id 등)은 명시적으로 제외.
+상세는 `docs/spec/determinism-and-fingerprint.md`.
+
+13-4. Idempotency as First-class (P4)
+
+모든 Task는 실행 전 idempotency 조회가 선행.
+"실행"이 아니라 "결과 확정"이 비용 단위.
+idempotency hit 시 Attempt를 만들지 않고 TASK_DEDUPED로 직행.
+
+13-5. Commit Gate Pattern (P5)
+
+staged → verify → committed 3단계.
+성공 정의는 "실행 완료"가 아니라 "검증 통과 후 commit".
+검증 항목: hash 무결성, size 일치, manifest 존재, schema 적합성, policy 적합성.
+
+13-6. Event-sourced Projection (P6)
+
+상태는 authority에, 읽기 모델은 projection에.
+Projector 무해화 키: (aggregate_id, aggregate_version).
+Dispatcher 중복 방지 키: event_id.
+Gap 처리: retry queue + timeout alert.
+
+13-7. Capability Isolation (P7)
+
+외부 I/O step은 Capability step으로 명시(IR 수준 step_type 태깅).
+Replay 시 Capability step은 dispatch 레벨에서 구조적으로 실행 불가.
+Pure/Transform만 replay 가능.
+
+13-8. Lineage-complete System (P8)
+
+모든 artifact는 upstream lineage로 역추적 가능.
+Lineage edge 최소 키: (run_id, task_id, artifact_ref, step_version, execution_fingerprint).
+Partial recompute가 자동 계산 가능.
+
+14. Design Decisions Register (Canonical Answers)
+
+착수 전 해석이 갈리는 핵심 질문에 대한 고정 응답.
+상세는 `docs/USE_CASES_AND_MODULES.md` Section D를 참조.
+
+14-1. Idempotency hit 시 Attempt 생성 여부 → 만들지 않는다 (TASK_DEDUPED terminal)
+14-2. ARTIFACT_STAGED 기록 주체 → 서버가 기록 (워커 commit_artifact 호출 → 서버 S3 head 확인)
+14-3. Replay에서 step 타입 판정 → IR 수준 step_type 태깅 (Pure/Transform/Capability)
+14-4. "단일 active attempt" 정의 → {LEASED, RUNNING, VERIFYING} 중 하나라도 존재하면 새 Attempt 금지
+14-5. Rerun에서 policy_digest 변경 시 → fingerprint 변경 → idempotency miss → 새 실행
+14-6. Drift signal 임계치 단위 → workflow_version × source_group 단위, 기본 30%
+14-7. Admission token 발급 단위 → Attempt 단위 (1:1 바인딩)
+14-8. Outbox 중복 소비 무해화 키 → Projector: (aggregate_id, aggregate_version), Dispatcher: event_id
+
+15. Industry & Academic SOTA Alignment
+
+15-1. Industry Alignment
+
+본 시스템은 Temporal/Argo/Step Functions 계열 워크플로우 엔진과 아래를 공유한다:
+- 상태 머신 기반 실행 (Temporal의 workflow state, Argo의 node phases)
+- 재시도·재실행 모델 내장 (Temporal의 activity retry, Argo의 retryStrategy)
+- 이벤트 기반 확장 (Step Functions의 EventBridge 연동)
+
+차별화 포인트:
+- execution_fingerprint 기반 결과 재사용을 SSOT로 삼는 구조 (타 엔진에 없음)
+- capability step 격리를 통한 강한 replay 보장 (Temporal replay는 activity 재실행 허용)
+- lineage 중심 partial recompute 설계 (타 엔진에서 별도 시스템 필요)
+
+15-2. Academic Alignment
+
+- Deterministic Workflow Model: 동일 입력·동일 버전·동일 정책 → 동일 결과 (by construction, 반형식적 증명 가능)
+- Reproducible Dataflow: RawIndex + immutable raw store로 데이터 재현성 확보 (FAIR 원칙 정합)
+- Causal Lineage Graph: DAG 기반 인과 관계 추적, 영향 분석·부분 재계산 이론과 정합 (provenance 연구 계열)
+

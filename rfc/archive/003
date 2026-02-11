@@ -1,0 +1,370 @@
+RFC-CRAWL-ORCHESTRATION-003-SOTA
+
+Title: Versioned Workflow IR 기반 SOTA 크롤링·수집 오케스트레이션 플랫폼
+Status: FINAL (SOTA Target)
+Goal: 10년 단위 진화 가능한 크롤링/수집 플랫폼의 구조적 완결성
+Primary Target: AWS
+Secondary Goal: 멀티클라우드/온프렘/실기기 이식성
+
+1. Executive Summary
+
+1-1. 핵심 정의
+본 RFC는 크롤링 플랫폼을 Workflow IR 중심의 결정론적 데이터 수집 시스템으로 정의함.
+DAG는 표현(View)이고, 진짜 SSOT는 Workflow IR임.
+
+1-2. 3대 SSOT
+
+Definition SSOT = Workflow IR
+
+Execution SSOT = Run/Task/Attempt/Artifact
+
+Data SSOT = Raw + Lineage Graph
+
+1-3. SOTA 차별점
+
+Deterministic Workflow Contract
+
+Lineage Graph SSOT
+
+Cost-aware Orchestration
+
+Capability 분리 실행 모델
+
+Engine/Cloud 독립 구조
+
+2. Non-Negotiable Laws
+
+2-1. Law-SSOT-IR-1
+Workflow의 진실은 DAG가 아니라 Workflow IR임.
+
+2-2. Law-IMMUTABLE-1
+Publish된 workflow_version은 불변.
+
+2-3. Law-RAW-1
+Raw는 삭제/수정 금지.
+
+2-4. Law-DET-1
+Step 결과는
+(step_version, canonical_input, capability_profile)
+에 의해 결정됨.
+
+2-5. Law-DET-2
+time/random/env는 명시적 입력으로만 사용.
+
+2-6. Law-IDEMP-RESULT-1
+멱등은 결과 재사용까지 포함.
+
+2-7. Law-LINEAGE-1
+모든 Artifact는 Lineage Graph에 연결됨.
+
+2-8. Law-BUDGET-1
+모든 Workflow는 실행 예산을 가짐.
+
+2-9. Law-ENGINE-SWAP-1
+IR은 특정 엔진에 종속되지 않음.
+
+3. Workflow IR 모델
+
+3-1. IR 목적
+
+결정론 보장
+
+엔진 독립성
+
+정적 검증 가능성
+
+장기 호환성
+
+3-2. IR 구성요소
+
+Step Nodes
+
+Data Edges
+
+Control Directives
+
+Capability Bindings
+
+Budget Envelope
+
+3-3. DAG와의 관계
+DAG = IR의 시각적 Projection
+IR이 SSOT, DAG는 UI View.
+
+4. Step 모델
+
+4-1. Step 유형
+
+Pure Step
+
+Deterministic
+
+동일 입력 = 동일 출력
+
+Capability Step
+
+외부 세계 접근
+
+Raw 생성 유일 경로
+
+Control Step
+
+분기/Map/RateLimit
+
+4-2. Step 스펙
+
+step_version
+
+input_schema
+
+output_schema
+
+cost_hint
+
+determinism_class
+
+5. Determinism Contract
+
+5-1. Canonicalization
+canonical(input) 스펙 버전화 필수.
+
+5-2. Non-determinism 주입
+
+time_seed
+
+random_seed
+
+network_profile
+모두 TaskContext로 명시.
+
+5-3. Replay 보장
+Replay 시 외부 호출 금지.
+Raw + IR 기반 재계산만 허용.
+
+6. Execution SSOT
+
+6-1. Entities
+
+Run
+
+Task
+
+TaskAttempt
+
+Artifact
+
+IdempotencyRecord
+
+6-2. Key
+idempotency_key =
+(step_version + input_digest + workflow_version)
+
+6-3. Result Reuse
+중복 실행 시 기존 Artifact 반환.
+
+7. Lineage Graph SSOT
+
+7-1. 모델
+Node = Artifact
+Edge = Transform
+
+7-2. 저장
+Lineage Graph는 별도 SSOT.
+
+7-3. 활용
+
+역추적
+
+Partial Recompute
+
+영향 분석
+
+Provenance 증명
+
+8. Cost-Aware Orchestration
+
+8-1. Step Cost Hint
+
+expected_fetches
+
+expected_cpu
+
+expected_fanout
+
+8-2. Workflow Budget
+
+request_budget
+
+time_budget
+
+compute_budget
+
+8-3. Scheduler 역할
+예산 기반 throttling 수행.
+
+9. AWS 참조 아키텍처
+
+9-1. Core
+EventBridge
+Step Functions
+SQS
+ECS Fargate
+DynamoDB
+RDS
+S3
+
+9-2. 역할 분리
+SFN = 제어/집계
+Fan-out = SQS + Worker
+
+10. External/Device Worker
+
+10-1. Pull 모델
+SQS poll 기반.
+
+10-2. Registry
+
+worker_id
+
+capability
+
+network_profile
+
+10-3. Commit Protocol
+presigned upload → digest 검증 → 서버 확정.
+
+11. DSL
+
+11-1. 형식
+JSON 기반 선언형 DSL.
+
+11-2. 검증
+OpenAPI/Zod 공유 스키마.
+
+11-3. DSL은 IR의 직렬화 표현.
+
+12. Data Layout
+
+12-1. RDS
+workflows
+workflow_versions
+sources
+step_catalog
+
+12-2. DynamoDB
+runs
+tasks
+attempts
+idempotency_records
+locks
+
+12-3. S3
+raw
+derived
+logs
+debug
+
+13. Frontend DAG Studio (SOTA 규칙)
+
+13-1. DAG는 IR View
+프론트는 IR을 편집하지 DAG를 편집하지 않음.
+
+13-2. Predictive Simulation
+DAG 변경 시
+
+예상 fan-out
+
+예상 비용
+
+실패 hotspot
+자동 표시.
+
+13-3. Risk Score
+DAG마다 risk score 계산.
+임계 초과 시 publish 차단.
+
+13-4. Auto Lint
+
+무한 fan-out
+
+sink 없는 흐름
+
+과도 retry
+자동 차단.
+
+13-5. Subgraph 모델
+대형 DAG는 계층형 Subgraph로 분리.
+
+14. Versioning
+
+14-1. 모든 변경은 새 버전
+Patch 수정 없음.
+
+14-2. Snapshot
+Publish 시 canonicalized IR snapshot 저장.
+
+14-3. Rollback
+이전 버전 재활성화 방식.
+
+15. Implementation Roadmap
+
+15-1. Phase 1
+IR 모델
+CRUD
+HttpFetch
+Raw SSOT
+
+15-2. Phase 2
+Lineage Graph
+Replay
+SQS fan-out
+
+15-3. Phase 3
+Device Workers
+Cost Model
+Predictive DAG Studio
+
+15-4. Phase 4
+Multi-engine
+Multi-cloud
+
+16. SOTA Positioning
+
+16-1. 왜 SOTA인지
+
+DAG가 아닌 IR 중심
+
+결정론 계약 명문화
+
+Lineage Graph 1급 객체
+
+비용 인지 스케줄링
+
+Capability 분리 실행
+
+16-2. 시비 방어 논리
+
+재현성 수학적으로 보장
+
+실행 의미론 스펙화
+
+외부 세계 접촉을 모델로 격리
+
+장기 데이터 lineage 보존
+
+17. 최종 결론
+
+본 설계는
+
+대규모 크롤링
+
+장기 운영
+
+재현성 요구
+
+실기기 실행
+환경에서 구조적 결함 없는 모델임.
+
+Workflow IR + Determinism Contract + Lineage Graph + Cost-aware Orchestration 조합은
+현재 업계/학계 기준에서도 상위 SOTA 설계군에 해당함.
+

@@ -1,0 +1,339 @@
+RFC-CRAWL-ORCHESTRATION-004-ADDENDUM
+
+Title: SOTA+ Hardening Addendum — Authority 분리, Replay 인덱싱, Admission Control, Deterministic Semantics
+Status: FINAL ADDENDUM
+Scope: RFC-003 보완 및 “운영 지옥에서도 시비 불가” 수준으로 격상
+
+1. Executive Summary
+
+1-1. 목적
+본 Addendum은 기존 SOTA 설계를 실제 대규모 운영 환경에서의
+
+상태 정합성
+
+Replay 성능
+
+물리적 자원 한계
+
+결정론 보장
+관점에서 한 단계 더 강화함.
+
+1-2. 핵심 강화 축 4가지
+
+Authority-Split + Event Projection 모델
+
+Raw Lookup 전용 Index SSOT
+
+Admission Control 기반 물리 Backpressure
+
+Deterministic Execution Semantics 명문화
+
+1-3. 결과
+
+RDS/Dynamo 정합성 논쟁 종결
+
+Replay O(1)급 조회
+
+IP/Proxy 한계 모델링
+
+재현성에 대한 학계 수준 방어 가능
+
+2. Authority & Transaction Model
+2-1. Authority Split 원칙
+
+2-1-1. Law-AUTH-1
+각 도메인은 단 하나의 권위 저장소만 가짐.
+
+2-1-2. 정의
+Definition Authority = RDS
+Execution Authority = DynamoDB
+Lineage Authority = Lineage Store
+Raw Authority = S3 + RawIndex
+
+교차 트랜잭션 금지.
+
+2-2. Projection 모델
+
+2-2-1. Law-PROJ-1
+교차 저장소 상태는 Projection일 뿐 SSOT가 아님.
+
+2-2-2. 패턴
+
+모든 상태 변화는 Domain Event 발행
+
+EventBridge/Kafka로 전파
+
+각 스토어는 비동기 projection 유지
+
+예
+Run 생성 → Dynamo 기록 → run_created 이벤트 → RDS에 요약 projection
+
+2-3. Publish Semantics
+
+2-3-1. Publish는 RDS 트랜잭션 내부에서만 완료됨.
+2-3-2. publish 완료 후에만 workflow_version_published 이벤트 발행.
+3-3. 실행 레이어는 이벤트 기반으로만 인지.
+
+3. Raw Lookup & Replay Index SSOT
+3-1. RawIndex 테이블
+
+Replay 성능을 위한 전용 SSOT.
+
+PK
+source_id#url_digest
+
+SK
+fetched_at#attempt_id
+
+Attributes
+
+s3_raw_path
+
+manifest_path
+
+policy_digest
+
+fetcher_profile_digest
+
+status
+
+content_digest
+
+3-2. Raw Selection Rules
+
+Rule-RAW-SELECT-1
+policy_digest + fetcher_profile_digest 일치 우선.
+
+Rule-RAW-SELECT-2
+없으면 latest successful.
+
+Rule-RAW-SELECT-3
+그래도 없으면 Replay 실패.
+
+Replay는 항상 raw_ref를 결정적으로 선택해야 함.
+
+3-3. Replay Semantics 강화
+
+Replay =
+
+Capability Step 실행 금지
+
+Pure/Transform만 허용
+
+Raw는 명시적 참조 또는 결정 규칙으로 선택
+
+4. Admission Control & Physical Backpressure
+4-1. Admission Control Step
+
+Capability Step 앞에 필수.
+
+입력
+
+egress_profile
+
+proxy_pool_group
+
+domain_group
+
+출력
+
+admission_token
+
+토큰 없으면 실행 불가.
+
+4-2. ProxyPoolGroup 모델
+
+Fields
+
+pool_id
+
+capacity
+
+health_score
+
+ban_rate
+
+region/ASN metadata
+
+4-3. Law-ADMISSION-1
+
+외부 접속 Step은 admission_token 없이 실행 불가.
+
+4-4. Egress SSOT
+
+egress 상태는 별도 Dynamo 테이블.
+
+관리 항목
+
+pool health
+
+IP 상태
+
+ban history
+
+cooldown windows
+
+5. Deterministic Execution Semantics
+5-1. Step Class
+
+Pure Step
+
+결정론 함수
+
+외부 세계 접근 금지
+
+Capability Step
+
+외부 접촉
+
+Raw 생성 가능
+
+Control Step
+
+분기/Map/RateLimit
+
+5-2. Law-DET-CTX-1
+
+비결정 요소는 전부 TaskContext 입력.
+
+포함
+
+time_seed
+
+random_seed
+
+locale
+
+network_profile
+
+5-3. Determinism Contract
+
+Step Output = f(
+step_version,
+canonical_input,
+task_context,
+capability_profile
+)
+
+5-4. Canonicalization Versioning
+
+canonical_spec_version은
+WorkflowVersion에 포함되어야 함.
+
+6. Lineage as Computation Graph
+6-1. Lineage SSOT
+
+Node = Artifact
+Edge = Transform(step_version)
+
+6-2. 활용
+
+영향 분석
+
+부분 재계산
+
+Provenance 증명
+
+데이터 신뢰성 감사
+
+6-3. Law-LINEAGE-SSOT-1
+
+Derived 데이터는 Lineage에 연결되지 않으면 유효하지 않음.
+
+7. Cost-Aware Governance
+7-1. Cost Envelope
+
+WorkflowDefinition에 포함
+
+request_budget
+
+compute_budget
+
+time_budget
+
+7-2. Cost Ledger
+
+Run 단위 비용 기록 projection.
+
+Admin Studio 제공
+
+버전별 비용
+
+소스별 비용
+
+성공률 대비 비용
+
+8. Schema Drift Signal Model
+8-1. Drift Signal
+
+Validate 실패가 임계치 초과 시 drift_signal 이벤트 발행.
+
+8-2. 자동화 수준
+
+자동 Publish 금지
+
+Admin Studio가 “새 버전 제안” 생성
+
+인간 승인 필요
+
+9. DSL 확장 필드
+
+Step DSL에 추가
+
+admission_required: true
+egress_profile_ref
+proxy_pool_group_ref
+cost_hint
+determinism_class
+
+10. Phase Upgrade Roadmap
+
+Phase A
+Authority Split 정립
+RawIndex 도입
+
+Phase B
+Admission Control
+Egress SSOT
+
+Phase C
+Lineage Graph 1급화
+Cost Ledger
+
+Phase D
+Drift Signal 자동화
+
+11. SOTA+ 포지셔닝
+
+본 Addendum 포함 시
+
+데이터 수집 재현성
+
+물리 자원 모델링
+
+결정론 계약
+
+상태 정합성 모델
+
+비용 인지 운영
+
+측면에서
+일반 크롤링 시스템을 넘어
+데이터 플랫폼급 오케스트레이션 설계로 분류 가능.
+
+12. 최종 결론
+
+이 Addendum은
+“잘 만든 SOTA”를 넘어
+“장기 대규모 운영에서 반박하기 어려운 설계”를 목표로 함.
+
+Authority 분리
+Replay 인덱싱
+Admission 기반 물리 제어
+Deterministic Semantics
+Lineage SSOT
+
+이 5가지 축이 결합된 모델은
+현재 업계에서도 상위 설계군에 해당하며
+10년 이상 진화 가능한 구조적 기반을 제공함.
+
