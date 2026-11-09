@@ -1,6 +1,32 @@
+<p align="center"><img src="readme-banner.svg" alt="Crawler Engine / Design — Workflow authority, deterministic replay, lineage, and operating contracts." width="100%"></p>
+
 # Wine Crawler Engine Design
 
 A **design and operating-contract repository** for a collection engine. It connects RFC rationale to implementation specifications, operational runbooks, and architecture decisions. It is distinct from the runnable crawler application.
+
+
+## Engineering highlights
+
+| Mechanism | Engineering purpose |
+| :--- | :--- |
+| **Authority / event / projection split** | The design assigns one authority store to each domain and connects domains through events and projections rather than cross-store transactions. |
+| **Explicit execution identity** | Run, task, attempt, artifact, idempotency, and lease concepts have separate execution contracts. |
+| **Immutable raw capture and replay** | Raw metadata selection and immutable blob storage are specified separately from derived artifacts. |
+| **Lineage as a first-class model** | Artifact nodes and transform edges make derived outputs traceable to their inputs. |
+| **Operational failure contracts** | Runbooks cover replay, schema drift, backfill, egress incidents, cost governance, and retention/compliance. |
+
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    D["Definition authority: workflows and versions"] --> E["Domain events and projections"]
+    E --> X["Execution authority: runs, tasks, attempts"]
+    X --> R["Raw index and immutable blobs"]
+    R --> L["Lineage and derived artifacts"]
+    P["Admission and egress policy"] --> X
+    O["Runbooks and recovery contracts"] -.-> X
+```
 
 ## Reading order
 
