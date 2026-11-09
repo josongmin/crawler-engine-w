@@ -2,19 +2,19 @@
 
 # Wine Crawler Engine Design
 
-A **design and operating-contract repository** for a collection engine. It connects RFC rationale to implementation specifications, operational runbooks, and architecture decisions. It is distinct from the runnable crawler application.
+<p align="center"><a href="#engineering-highlights">Engineering</a> · <a href="#architecture-at-a-glance">Architecture</a> · <a href="#reading-order">Get started</a> · <a href="#core-contracts">Reference</a></p>
 
+A **design and operating-contract repository** for a collection engine. It connects RFC rationale to implementation specifications, operational runbooks, and architecture decisions. It is distinct from the runnable crawler application.
 
 ## Engineering highlights
 
-| Mechanism | Engineering purpose |
-| :--- | :--- |
-| **Authority / event / projection split** | The design assigns one authority store to each domain and connects domains through events and projections rather than cross-store transactions. |
-| **Explicit execution identity** | Run, task, attempt, artifact, idempotency, and lease concepts have separate execution contracts. |
-| **Immutable raw capture and replay** | Raw metadata selection and immutable blob storage are specified separately from derived artifacts. |
-| **Lineage as a first-class model** | Artifact nodes and transform edges make derived outputs traceable to their inputs. |
-| **Operational failure contracts** | Runbooks cover replay, schema drift, backfill, egress incidents, cost governance, and retention/compliance. |
-
+| Mechanism | Engineering purpose | Source |
+| :--- | :--- | :--- |
+| **Authority / event / projection split** | The design assigns one authority store to each domain and connects domains through events and projections rather than cross-store transactions. | [Authority spec](docs/spec/authority-and-events.md) |
+| **Explicit execution identity** | Run, task, attempt, artifact, idempotency, and lease concepts have separate execution contracts. | [Execution spec](docs/spec/execution-semantics.md) |
+| **Immutable raw capture and replay** | Raw metadata selection and immutable blob storage are specified separately from derived artifacts. | [Replay spec](docs/spec/raw-and-replay-index.md) |
+| **Lineage as a first-class model** | Artifact nodes and transform edges make derived outputs traceable to their inputs. | [Lineage spec](docs/spec/lineage-graph.md) |
+| **Operational failure contracts** | Runbooks cover replay, schema drift, backfill, egress incidents, cost governance, and retention/compliance. | [Runbooks](docs/runbooks/) |
 
 ## Architecture at a glance
 
@@ -54,3 +54,5 @@ Read `rfc/005` as the current canon. Earlier stubs and archived RFCs retain desi
 - [Coverage checklist](docs/COVERAGE.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Document templates](docs/templates)
+
+<p align="center"><sub><a href="https://github.com/josongmin">Project map</a> · <a href="#engineering-highlights">Back to overview</a></sub></p>
